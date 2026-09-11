@@ -14,14 +14,29 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator
 
-from Model.ai_model import ChatResponse, ai_model
+from Model.ai_model import (
+    AIModelError,
+    ChatResponse,
+    ai_model,
+    installed_models,
+    matches_installed,
+)
 from Engine.models import user
 
 logger = logging.getLogger(__name__)
 
 
 class LLMAccessError(PermissionError):
-    """Le compte n'existe pas ou n'est rattaché à aucune équipe."""
+    """Le compte n'existe pas, n'a pas d'équipe, ou n'a pas droit au modèle."""
+
+
+class LLMModelUnavailable(RuntimeError):
+    """Le modèle est autorisé, mais absent du serveur d'inférence.
+
+    Distinct de `LLMAccessError` : ce n'est pas un refus de droits mais un
+    écart entre le catalogue et le parc installé. Le message doit orienter
+    vers l'administrateur, pas vers une demande d'habilitation.
+    """
 
 
 class llm:
@@ -52,7 +67,75 @@ class llm:
                 f"Le compte '{self.user.email}' n'est rattaché à aucune équipe."
             )
 
+        # Le modèle courant doit être dans les habilitations de l'utilisateur.
+        if not await self.user.can_use_model(self.model.model):
+            raise LLMAccessError(
+                f"Le modèle '{self.model.model}' n'est pas autorisé pour "
+                f"'{self.user.email}'."
+            )
+
         self._authorized = True
+
+    # -----------------------------------------------------------------
+    def _base_url(self) -> str | None:
+        base = getattr(self.model.client, "base_url", None)
+        return str(base) if base else None
+
+    async def installed(self) -> set[str] | None:
+        """Modèles présents sur le serveur, ou None s'il est injoignable."""
+        try:
+            return await installed_models(self._base_url())
+        except AIModelError as exc:
+            logger.warning("Inventaire du serveur d'inférence indisponible : %s", exc)
+            return None
+
+    async def available_models(self, only_installed: bool = True) -> list[dict]:
+        """Modèles que cet utilisateur peut choisir.
+
+        Par défaut, l'intersection entre ses habilitations et ce qui est
+        réellement chargé sur le serveur : proposer un modèle cataloguté
+        mais désinstallé revient à offrir un bouton qui renvoie une 404.
+
+        Si le serveur est injoignable, la liste complète est renvoyée —
+        une liste vide priverait l'utilisateur de tout choix alors que le
+        problème est ailleurs et sans doute temporaire.
+        """
+        modeles = await self.user.allowed_models()
+        if not only_installed:
+            return modeles
+
+        disponibles = await self.installed()
+        if disponibles is None:
+            return modeles
+
+        return [m for m in modeles if matches_installed(m["code_model"], disponibles)]
+
+    async def switch_model(self, code_model: str) -> None:
+        """Change de modèle sans perdre la conversation.
+
+        Deux contrôles, dans cet ordre : l'habilitation, puis la présence
+        sur le serveur. Ils sont refaits ici et pas seulement à
+        l'affichage — la liste envoyée à l'IHM est un confort, rien
+        n'empêche un client de demander autre chose.
+        """
+        if code_model == self.model.model:
+            return
+
+        if not await self.user.can_use_model(code_model):
+            raise LLMAccessError(
+                f"Le modèle '{code_model}' n'est pas autorisé pour '{self.user.email}'."
+            )
+
+        disponibles = await self.installed()
+        if disponibles is not None and not matches_installed(code_model, disponibles):
+            raise LLMModelUnavailable(
+                f"Le modèle '{code_model}' est autorisé mais n'est pas installé "
+                "sur le serveur d'inférence. Signale-le à un administrateur."
+            )
+
+        ancien = self.model.model
+        self.model.model = code_model
+        logger.info("%s : modèle %s -> %s", self.user.email, ancien, code_model)
 
     # -----------------------------------------------------------------
     def _system_prompt(self) -> str:
@@ -114,14 +197,3 @@ class llm:
     def reset(self) -> None:
         """Vide l'historique sans perdre l'autorisation ni le contexte."""
         self.model.reset(self._system_prompt())
-
-    def response_llm_rag(self):
-        """
-        Méthode pour générer une réponse à partir du modèle LLM avec RAG.
-        Returns:
-            str: La réponse générée par le modèle LLM avec RAG.
-        """
-        pass
-        
-        
-    

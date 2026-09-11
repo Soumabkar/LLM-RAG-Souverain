@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import psycopg
 
-from .db import get_connection
-from .security import ensure_hashed, needs_rehash, verify_password
+from Engine.db import get_connection
+from Engine.security import ensure_hashed, needs_rehash, verify_password
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,9 @@ MAX_LEN = {
     "password": 256,
     "code_team": 256,
     "team_name": 50,
+    "code_model": 128,
+    "display_name": 50,
+    "description": 256,
 }
 
 
@@ -269,6 +272,43 @@ class user:
                  WHERE email = %s AND code_team = %s
                 """,
                 (self.email, code_team),
+            )
+            return await cur.fetchone() is not None
+
+    # -----------------------------------------------------------------
+    # Modèles accessibles
+    # -----------------------------------------------------------------
+    async def allowed_models(self) -> list[dict[str, Any]]:
+        """Union des modèles actifs des équipes de l'utilisateur.
+
+        Un compte sans équipe n'a accès à aucun modèle : c'est la
+        conséquence directe de la règle d'habilitation par équipe.
+        """
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT code_model, display_name, description
+                  FROM llm_souverain.v_user_models
+                 WHERE email = %s
+                 ORDER BY display_name
+                """,
+                (self.email,),
+            )
+            return await cur.fetchall()
+
+    async def can_use_model(self, code_model: str) -> bool:
+        """Contrôle unitaire, à faire côté serveur avant tout appel.
+
+        La liste envoyée à l'IHM n'est qu'un confort d'affichage : rien
+        n'empêche un client de demander un autre modèle.
+        """
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT 1 FROM llm_souverain.v_user_models
+                 WHERE email = %s AND code_model = %s
+                """,
+                (self.email, code_model),
             )
             return await cur.fetchone() is not None
 
@@ -517,6 +557,74 @@ class team:
         self.members = [row["email"] for row in rows]
         return self.members
 
+    # -----------------------------------------------------------------
+    # Modèles autorisés
+    # -----------------------------------------------------------------
+    async def add_model(self, code_model: str) -> Result:
+        """Autorise un modèle du catalogue pour l'équipe."""
+        try:
+            async with get_connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO llm_souverain.team_model (code_team, code_model)
+                    VALUES (%s, %s)
+                    ON CONFLICT (code_team, code_model) DO NOTHING
+                    """,
+                    (self.code_team, code_model),
+                )
+                if cur.rowcount == 0:
+                    return Result(
+                        False,
+                        f"Le modèle '{code_model}' est déjà autorisé pour '{self.code_team}'.",
+                    )
+
+            logger.info("Modèle %s autorisé pour l'équipe %s", code_model, self.code_team)
+            return Result(True, f"Modèle '{code_model}' autorisé pour '{self.code_team}'.")
+
+        except psycopg.errors.ForeignKeyViolation as exc:
+            if exc.diag.constraint_name == "fk_team_model_model":
+                return Result(False, f"Le modèle '{code_model}' n'est pas au catalogue.")
+            return Result(False, f"L'équipe '{self.code_team}' n'existe pas.")
+        except psycopg.Error as exc:
+            return Result(False, f"Erreur base de données : {exc}")
+
+    async def remove_model(self, code_model: str) -> Result:
+        """Retire l'autorisation."""
+        try:
+            async with get_connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM llm_souverain.team_model
+                     WHERE code_team = %s AND code_model = %s
+                    """,
+                    (self.code_team, code_model),
+                )
+                if cur.rowcount == 0:
+                    return Result(
+                        False,
+                        f"Le modèle '{code_model}' n'est pas autorisé pour '{self.code_team}'.",
+                    )
+
+            return Result(True, f"Modèle '{code_model}' retiré de '{self.code_team}'.")
+
+        except psycopg.Error as exc:
+            return Result(False, f"Erreur base de données : {exc}")
+
+    async def load_models(self) -> list[dict[str, Any]]:
+        """Modèles actifs autorisés pour l'équipe."""
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT m.code_model, m.display_name, m.description
+                  FROM llm_souverain.team_model t
+                  JOIN llm_souverain.model_llm  m ON m.code_model = t.code_model
+                 WHERE t.code_team = %s AND m.active
+                 ORDER BY m.display_name
+                """,
+                (self.code_team,),
+            )
+            return await cur.fetchall()
+
     @classmethod
     async def load(cls, code_team: str) -> "team | None":
         """Instancie une `team` à partir de la base."""
@@ -535,6 +643,193 @@ class team:
         instance = cls(row["code_team"], row["team_name"], row["email"])
         await instance.load_members()
         return instance
+
+
+# =====================================================================
+# model_llm
+# =====================================================================
+class model_llm:
+    """Un modèle du catalogue. L'habilitation se fait par équipe."""
+
+    def __init__(
+        self,
+        code_model: str,
+        display_name: str,
+        description: str | None = None,
+        active: bool = True,
+    ):
+        self.code_model = code_model
+        self.display_name = display_name
+        self.description = description
+        self.active = active
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"model_llm(code_model={self.code_model!r}, active={self.active})"
+
+    # -----------------------------------------------------------------
+    async def create_model(
+        self,
+        verify: bool = True,
+        verifier: "Callable[[str], Awaitable[bool]] | None" = None,
+    ) -> Result:
+        """Ajoute le modèle au catalogue, s'il est installé sur le serveur.
+
+        Sans ce contrôle, une faute de frappe dans `code_model` ne se
+        révélerait qu'au premier message d'un utilisateur, sous la forme
+        d'une erreur du serveur d'inférence — loin de sa cause.
+
+        Args:
+            verify: passer False pour amorcer un catalogue hors ligne
+                (migration, jeu de test, serveur pas encore démarré).
+            verifier: coroutine `(code_model) -> bool` remplaçant
+                l'interrogation du serveur. Sert aux tests, et permet de
+                brancher un autre moteur d'inférence.
+        """
+        erreur = _first_error(
+            _check("code_model", self.code_model, "code_model"),
+            _check("display_name", self.display_name, "nom affiché"),
+            _check("description", self.description, "description", obligatoire=False),
+        )
+        if erreur:
+            return Result(False, erreur)
+
+        if verify:
+            if verifier is None:
+                # Import différé : la couche base n'a pas à charger le SDK
+                # d'inférence quand la vérification est désactivée.
+                from Model.ai_model import is_model_installed as verifier
+
+            try:
+                installe = await verifier(self.code_model)
+            except Exception as exc:  # noqa: BLE001 - AIModelError ou réseau
+                logger.warning("Vérification impossible pour %s : %s", self.code_model, exc)
+                return Result(False, str(exc))
+
+            if not installe:
+                return Result(
+                    False,
+                    f"Le modèle '{self.code_model}' n'est pas installé sur le "
+                    f"serveur d'inférence. L'installer d'abord "
+                    f"(`ollama pull {self.code_model}`), puis réessayer.",
+                )
+
+        try:
+            async with get_connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO llm_souverain.model_llm
+                        (code_model, display_name, description, active)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (code_model) DO NOTHING
+                    """,
+                    (self.code_model, self.display_name, self.description, self.active),
+                )
+                if cur.rowcount == 0:
+                    return Result(False, f"Le modèle '{self.code_model}' existe déjà.")
+
+            logger.info("Modèle %s ajouté au catalogue", self.code_model)
+            return Result(True, f"Modèle '{self.code_model}' ajouté.")
+
+        except psycopg.Error as exc:
+            logger.exception("Échec d'ajout du modèle %s", self.code_model)
+            return Result(False, f"Erreur base de données : {exc}")
+
+    # -----------------------------------------------------------------
+    async def set_active(self, active: bool) -> Result:
+        """Active ou désactive le modèle.
+
+        Désactiver le retire de toutes les équipes côté lecture, sans
+        supprimer les habilitations : les réactiver est immédiat.
+        """
+        try:
+            async with get_connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE llm_souverain.model_llm SET active = %s WHERE code_model = %s",
+                    (active, self.code_model),
+                )
+                if cur.rowcount == 0:
+                    return Result(False, f"Le modèle '{self.code_model}' n'existe pas.")
+
+            self.active = active
+            etat = "activé" if active else "désactivé"
+            return Result(True, f"Modèle '{self.code_model}' {etat}.")
+
+        except psycopg.Error as exc:
+            return Result(False, f"Erreur base de données : {exc}")
+
+    # -----------------------------------------------------------------
+    async def delete_model(self) -> Result:
+        """Retire le modèle du catalogue et de toutes les équipes."""
+        try:
+            async with get_connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT count(*) AS nb FROM llm_souverain.team_model WHERE code_model = %s",
+                    (self.code_model,),
+                )
+                nb = (await cur.fetchone())["nb"]
+
+                await cur.execute(
+                    "DELETE FROM llm_souverain.model_llm WHERE code_model = %s",
+                    (self.code_model,),
+                )
+                if cur.rowcount == 0:
+                    return Result(False, f"Le modèle '{self.code_model}' n'existe pas.")
+
+            return Result(
+                True, f"Modèle '{self.code_model}' supprimé, {nb} habilitation(s) retirée(s)."
+            )
+
+        except psycopg.Error as exc:
+            return Result(False, f"Erreur base de données : {exc}")
+
+    # -----------------------------------------------------------------
+    @staticmethod
+    async def non_catalogues(base_url: str | None = None) -> list[str]:
+        """Modèles installés sur le serveur mais absents du catalogue.
+
+        L'écart inverse — catalogué mais désinstallé — se voit avec
+        `verifier_catalogue()`.
+        """
+        from Model.ai_model import installed_models
+
+        from Model.ai_model import matches_installed
+
+        disponibles = await installed_models(base_url)
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT code_model FROM llm_souverain.model_llm")
+            connus = {ligne["code_model"] for ligne in await cur.fetchall()}
+        return sorted(m for m in disponibles if not any(matches_installed(c, {m}) for c in connus))
+
+    @staticmethod
+    async def verifier_catalogue(base_url: str | None = None) -> list[str]:
+        """Modèles catalogués qui ne sont plus installés.
+
+        À passer au démarrage ou en supervision : ces entrées sont
+        proposées aux utilisateurs mais échoueront à l'appel.
+        """
+        from Model.ai_model import installed_models, matches_installed
+
+        disponibles = await installed_models(base_url)
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT code_model FROM llm_souverain.model_llm WHERE active"
+            )
+            actifs = {ligne["code_model"] for ligne in await cur.fetchall()}
+        return sorted(c for c in actifs if not matches_installed(c, disponibles))
+
+    @staticmethod
+    async def catalogue(actifs_seulement: bool = True) -> list[dict[str, Any]]:
+        """Tout le catalogue, pour une IHM d'administration."""
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT code_model, display_name, description, active
+                  FROM llm_souverain.model_llm
+                 {"WHERE active" if actifs_seulement else ""}
+                 ORDER BY display_name
+                """
+            )
+            return await cur.fetchall()
 
 
 # =====================================================================

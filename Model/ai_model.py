@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
@@ -20,6 +21,8 @@ import openai
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
 DEFAULT_SYSTEM_PROMPT = (
     "Tu es l'assistant interne de la plateforme LLM souverain. "
@@ -30,6 +33,53 @@ DEFAULT_SYSTEM_PROMPT = (
 
 class AIModelError(RuntimeError):
     """Erreur non récupérable après épuisement des tentatives."""
+
+
+# =====================================================================
+# Inventaire du serveur d'inférence
+# =====================================================================
+async def installed_models(base_url: str | None = None) -> set[str]:
+    """Identifiants des modèles réellement chargés sur le serveur.
+
+    Lève `AIModelError` si le serveur est injoignable : « aucun modèle
+    installé » et « serveur éteint » appellent des messages différents,
+    les confondre enverrait l'administrateur sur une fausse piste.
+    """
+    client = AsyncOpenAI(base_url=base_url or DEFAULT_OLLAMA_URL, api_key="ollama")
+    try:
+        page = await client.models.list()
+        return {m.id for m in page.data}
+    except openai.OpenAIError as exc:
+        raise AIModelError(
+            f"Serveur d'inférence injoignable sur {base_url or DEFAULT_OLLAMA_URL} : {exc}"
+        ) from exc
+    finally:
+        await client.close()
+
+
+def matches_installed(code_model: str, parc: set[str]) -> bool:
+    """Règle de correspondance entre un code catalogué et le parc installé.
+
+    Ollama nomme ses modèles « famille:tag ». Un code sans tag correspond
+    à n'importe quel tag installé — « qwen2.5 » reconnaît
+    « qwen2.5:latest », et le serveur résout de la même façon à l'appel.
+    Avec un tag explicite, la comparaison est stricte : « llama3.2:3b »
+    et « llama3.2:latest » sont des poids différents.
+
+    Fonction unique et synchrone à dessein : catalogage, supervision et
+    filtrage du sélecteur doivent appliquer exactement le même critère,
+    sinon un modèle accepté à l'ajout se retrouve signalé manquant.
+    """
+    if code_model in parc:
+        return True
+    if ":" not in code_model:
+        return any(m.split(":", 1)[0] == code_model for m in parc)
+    return False
+
+
+async def is_model_installed(code_model: str, base_url: str | None = None) -> bool:
+    """Vrai si le modèle est chargé sur le serveur."""
+    return matches_installed(code_model, await installed_models(base_url))
 
 
 @dataclass
@@ -79,7 +129,7 @@ class ai_model:
     @classmethod
     def from_ollama(
         cls,
-        model: str = "llama3.2",
+        model: str = "llama3.1:8b",
         base_url: str = "http://localhost:11434/v1",
         **kwargs: Any,
     ) -> "ai_model":

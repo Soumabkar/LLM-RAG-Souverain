@@ -1,4 +1,4 @@
-"""Intégration Chainlit : chainlit run app/chainlit_app.py -w
+"""Intégration Chainlit : chainlit run Interface/chainlit_app.py -w
 
 Une instance d'`ai_model` par session, pour que l'historique ne fuite pas
 d'un utilisateur à l'autre.
@@ -15,6 +15,7 @@ import logging
 import os
 
 import chainlit as cl
+from chainlit.input_widget import Select
 
 from Model.ai_model import AIModelError, ai_model
 from Engine.db import close_pool
@@ -23,8 +24,8 @@ from Engine.models import authenticate, user
 
 logging.basicConfig(level=logging.INFO)
 
-OLLAMA_URL = os.getenv("OLLAMA_BASE_URL")
-DEFAULT_MODEL = os.getenv("LLM_MODEL")
+OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "llama3.1:8b")
 
 
 # =====================================================================
@@ -74,6 +75,21 @@ async def on_chat_start() -> None:
         await cl.Message(content=f"Compte inconnu : `{email}`.").send()
         return
 
+    # Les modèles viennent des équipes de l'utilisateur, pas d'une constante.
+    modeles = await compte.allowed_models()
+    if not modeles:
+        await cl.Message(
+            content=(
+                f"Aucun modèle n'est autorisé pour `{compte.email}`. "
+                "Demande à un administrateur de rattacher ton équipe à un modèle."
+            )
+        ).send()
+        return
+
+    # Modèle d'ouverture : celui du .env s'il est autorisé, sinon le premier.
+    codes = [m["code_model"] for m in modeles]
+    model.model = DEFAULT_MODEL if DEFAULT_MODEL in codes else codes[0]
+
     assistant = llm(model, compte)
     try:
         await assistant.authorize()
@@ -82,9 +98,57 @@ async def on_chat_start() -> None:
         return
 
     cl.user_session.set("assistant", assistant)
+
+    # Sélecteur de modèle, limité aux habilitations. ChatSettings plutôt que
+    # les chat profiles : changer de profil repart d'une conversation vide,
+    # alors qu'ici l'historique survit à la bascule.
+    await cl.ChatSettings(
+        [
+            Select(
+                id="model",
+                label="Modèle",
+                # `items` porte à la fois le libellé et la valeur ; le passer
+                # en même temps que `values` est refusé par Chainlit.
+                items={m["display_name"]: m["code_model"] for m in modeles},
+                initial_value=model.model,
+            )
+        ]
+    ).send()
+
     equipes = ", ".join(compte.teams) or "aucune équipe"
+    courant = next(m["display_name"] for m in modeles if m["code_model"] == model.model)
     await cl.Message(
-        content=f"Bonjour {compte.login} ({equipes}) — modèle `{DEFAULT_MODEL}`."
+        content=(
+            f"Bonjour {compte.login} ({equipes}).\n"
+            f"Modèle : **{courant}** — {len(modeles)} modèle(s) disponible(s) "
+            "dans les paramètres."
+        )
+    ).send()
+
+
+@cl.on_settings_update
+async def on_settings_update(settings: dict) -> None:
+    """Bascule de modèle depuis le panneau de paramètres.
+
+    `switch_model` revérifie l'habilitation côté serveur : le contenu de
+    ce payload vient du navigateur et ne fait pas foi.
+    """
+    assistant: llm | None = cl.user_session.get("assistant")
+    if assistant is None:
+        return
+
+    demande = settings.get("model")
+    if not demande or demande == assistant.model.model:
+        return
+
+    try:
+        await assistant.switch_model(demande)
+    except LLMAccessError as exc:
+        await cl.Message(content=f"🔒 {exc}").send()
+        return
+
+    await cl.Message(
+        content=f"Modèle basculé sur `{demande}`. La conversation est conservée."
     ).send()
 
 

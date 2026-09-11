@@ -5,11 +5,11 @@ couche d'accès Python.
 
 | | |
 |---|---|
-| Version du schéma | 1.1 (association N-N) |
+| Version du schéma | 1.2 (modèles par équipe) |
 | Couche d'accès | asynchrone (asyncio) |
 | Base | PostgreSQL 16 |
 | Runtime | Python 3.11+ |
-| Dernière validation | 104 tests, PostgreSQL 16.15 |
+| Dernière validation | 137 tests, PostgreSQL 16.15 |
 
 ---
 
@@ -45,6 +45,12 @@ Un utilisateur peut appartenir à **plusieurs équipes** ; une équipe compte
 | RG-08 | Supprimer un compte le retire automatiquement de toutes ses équipes. |
 | RG-09 | Changer l'email d'un compte conserve ses rattachements. |
 | RG-10 | Le code d'une équipe est immuable après création. Pour le changer, créer une nouvelle équipe et y déplacer les membres. |
+| RG-11 | Chaque équipe dispose d'une liste de modèles autorisés, choisis dans un catalogue central. |
+| RG-12 | Un utilisateur accède à **l'union** des modèles de ses équipes. Un modèle accordé à deux de ses équipes n'apparaît qu'une fois. |
+| RG-13 | Un compte sans équipe n'a accès à aucun modèle, donc à aucune conversation. |
+| RG-14 | L'utilisateur change de modèle en cours de conversation, dans la limite de ses droits. L'historique est conservé. |
+| RG-15 | Désactiver un modèle au catalogue le retire de toutes les équipes sans supprimer les habilitations : la réactivation les restaure. |
+| RG-16 | Perdre une équipe fait perdre les modèles qu'elle seule accordait, immédiatement. |
 
 ### 1.3 Cas d'usage
 
@@ -84,6 +90,8 @@ sont rédigés en français et destinés à être affichés tels quels.
 | Champ vide | `Le champ login est obligatoire.` |
 | Champ trop long | `Le champ login fait 60 caractères (maximum 50).` |
 | Adhésion en double | `'x@y.fr' est déjà membre de l'équipe 'DATA-01'.` |
+| Modèle hors catalogue | `Le modèle 'inconnu:1b' n'est pas au catalogue.` |
+| Modèle non autorisé | `Le modèle 'mistral:7b' n'est pas autorisé pour 'x@y.fr'.` |
 | Suppression d'équipe | `Équipe 'DATA-01' supprimée, 2 adhésion(s) retirée(s).` |
 
 ### 1.5 Hors périmètre
@@ -123,15 +131,26 @@ llm-souverain-db/
 ### 2.2 Modèle de données
 
 ```
-   team_llm                team_member                 user_llm
-┌──────────────┐      ┌──────────────────┐      ┌──────────────────┐
-│ code_team PK │◄─────┤ code_team    PK  │─────►│ email        PK  │
-│ team_name    │  1:N │ email        PK  │ N:1  │ login    UNIQUE  │
-│ email        │      │ joined_at        │      │ password         │
-└──────────────┘      └──────────────────┘      └──────────────────┘
-                       ON DELETE CASCADE
-                       ON UPDATE CASCADE
+   model_llm              team_model                 team_llm
+┌───────────────┐    ┌──────────────────┐    ┌──────────────┐
+│ code_model PK │◄───┤ code_model   PK  │───►│ code_team PK │
+│ display_name  │    │ code_team    PK  │    │ team_name    │
+│ description   │    │ granted_at       │    │ email        │
+│ active        │    └──────────────────┘    └──────┬───────┘
+└───────────────┘                                   │
+                                                    │
+                       team_member                  │       user_llm
+                     ┌──────────────────┐           │  ┌──────────────────┐
+                     │ code_team    PK  │◄──────────┘  │ email        PK  │
+                     │ email        PK  │─────────────►│ login    UNIQUE  │
+                     │ joined_at        │              │ password         │
+                     └──────────────────┘              └──────────────────┘
+                      ON DELETE CASCADE partout
 ```
+
+Les modèles accessibles à un utilisateur se lisent par la chaîne
+`user_llm → team_member → team_model → model_llm`, exposée par la vue
+`v_user_models`.
 
 | Table | Colonne | Type | Contrainte |
 |---|---|---|---|
@@ -144,6 +163,25 @@ llm-souverain-db/
 | `team_member` | `code_team` | `varchar(256)` | PK composite, FK → `team_llm` |
 | | `email` | `varchar(256)` | PK composite, FK → `user_llm` |
 | | `joined_at` | `timestamptz` | `DEFAULT now()` |
+| `model_llm` | `code_model` | `varchar(128)` | PK, identifiant technique |
+| | `display_name` | `varchar(50)` | NOT NULL |
+| | `description` | `varchar(256)` | nullable |
+| | `active` | `boolean` | `DEFAULT true` |
+| `team_model` | `code_team` | `varchar(256)` | PK composite, FK → `team_llm` |
+| | `code_model` | `varchar(128)` | PK composite, FK → `model_llm` |
+| | `granted_at` | `timestamptz` | `DEFAULT now()` |
+
+**Pourquoi un catalogue plutôt que des noms libres.** Stocker
+`'llama3.1:8b'` directement dans `team_model` aurait évité une table, mais
+rien ne garantirait la cohérence des libellés entre équipes, et retirer un
+modèle du parc obligerait à balayer toutes les lignes. Avec `model_llm`,
+`active = false` suffit à le masquer partout, et la FK interdit d'habiliter
+un modèle qui n'existe pas.
+
+**Pourquoi `active` plutôt qu'une suppression.** Désactiver masque le
+modèle sans toucher aux habilitations : la réactivation restaure l'état
+antérieur. Supprimer la ligne du catalogue efface les `team_model` en
+cascade, et il faut alors tout ré-habiliter à la main.
 
 **Pourquoi une table d'association.** La colonne `user_llm.code_team` de la
 version 1.0 a été supprimée. La conserver *en plus* de `team_member` aurait
@@ -267,9 +305,13 @@ resultats = await asyncio.gather(*(t.create_team() for t in equipes))
 | | `change_email(new)` | change la clé primaire |
 | | `join_team(code)` / `leave_team(code)` | rattachement, détachement |
 | | `load_teams()` / `is_member_of(code)` | lecture des adhésions |
+| | `allowed_models()` | union des modèles de ses équipes |
+| | `can_use_model(code)` | contrôle unitaire, à faire côté serveur |
 | | `check_password(clair)` | vérifie contre l'empreinte stockée |
 | | `user.load(email)` / `user.find(email)` | chargement |
 | `team` | `create_team()` | insère l'équipe |
+| | `add_model(code)` / `remove_model(code)` | habilitations de l'équipe |
+| | `load_models()` | modèles actifs de l'équipe |
 | | `update_team()` | met à jour nom et email |
 | | `delete_team()` | supprime l'équipe, cascade sur les adhésions |
 | | `add_member_team(u)` / `delete_member_team(u)` | gestion des membres |
@@ -377,3 +419,37 @@ forcément d'un autre serveur.
 Depuis pgAdmin en revanche, l'hôte est `postgres` et le port `5432` : ce
 sont les valeurs internes au réseau Docker, indépendantes de la
 publication vers l'hôte.
+
+
+### 2.9 Modèles autorisés
+
+Trois niveaux : un catalogue central (`model_llm`), des habilitations par
+équipe (`team_model`), et un accès utilisateur déduit de ses adhésions.
+Aucun droit n'est porté par l'utilisateur lui-même — changer ses équipes
+change ses modèles, sans intervention supplémentaire.
+
+```python
+await model_llm("mistral:7b", "Mistral 7B", "Bon en français").create_model()
+await team("SEC-01", "Cybersécurité").add_model("mistral:7b")
+
+# L'utilisateur hérite de l'union de ses équipes
+codes = [m["code_model"] for m in await karim.allowed_models()]
+```
+
+**Le contrôle est refait à chaque usage.** `llm.authorize()` vérifie le
+modèle courant à l'ouverture de la conversation, et `llm.switch_model()`
+revérifie à chaque bascule. La liste envoyée à l'IHM n'est qu'un confort
+d'affichage : le payload d'un `on_settings_update` vient du navigateur et
+ne fait pas foi. Une habilitation révoquée en cours de session est donc
+appliquée au message suivant, pas seulement à la reconnexion.
+
+**Côté Chainlit**, le sélecteur passe par `cl.ChatSettings` plutôt que par
+les *chat profiles* : changer de profil repart d'une conversation vide,
+alors que `switch_model()` conserve l'historique — seul le nom du modèle
+transmis au serveur d'inférence change, le client et la conversation
+restent les mêmes.
+
+Un arbitrage à connaître : un compte sans équipe n'a **aucun** modèle et ne
+peut donc pas converser. Si tu veux un socle commun accessible à tous, le
+plus simple est une colonne `public BOOLEAN` sur `model_llm`, jointe en
+`OR` dans `v_user_models`.

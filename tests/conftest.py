@@ -16,9 +16,11 @@ import pytest
 import pytest_asyncio
 
 from Engine.db import close_pool, get_connection
-from Engine.models import team, user
+from Engine.models import model_llm, team, user
 
 TABLES = (
+    "llm_souverain.team_model",
+    "llm_souverain.model_llm",
     "llm_souverain.team_member",
     "llm_souverain.user_llm",
     "llm_souverain.team_llm",
@@ -91,3 +93,12 @@ async def karim(equipe_data) -> user:
     u = user("ksoumahoro", "MotDePasse!2026", "karim@entreprise.fr")
     assert await u.create_user("DATA-01")
     return u
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def catalogue(db) -> list[str]:
+    """Trois modèles au catalogue, aucun encore habilité."""
+    await model_llm("llama3.1:8b", "Llama 3.1 8B", "Généraliste").create_model(verify=False)
+    await model_llm("mistral:7b", "Mistral 7B", "Bon en français").create_model(verify=False)
+    await model_llm("qwen2.5-coder:7b", "Qwen Coder", "Code").create_model(verify=False)
+    return ["llama3.1:8b", "mistral:7b", "qwen2.5-coder:7b"]

@@ -93,3 +93,61 @@ BEGIN
     );
 END
 $$;
+
+-- ---------------------------------------------------------------------
+-- Table : model_llm  (catalogue des modèles)
+--
+-- code_model est l'identifiant technique passé au serveur d'inférence
+-- (« llama3.1:8b »), display_name ce que voit l'utilisateur.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS llm_souverain.model_llm (
+    code_model    VARCHAR(128) NOT NULL,
+    display_name  VARCHAR(50)  NOT NULL,
+    description   VARCHAR(256),
+    active        BOOLEAN      NOT NULL DEFAULT true,
+    CONSTRAINT pk_model_llm PRIMARY KEY (code_model)
+);
+
+COMMENT ON COLUMN llm_souverain.model_llm.code_model IS
+    'Identifiant technique transmis au serveur d''inférence';
+COMMENT ON COLUMN llm_souverain.model_llm.active IS
+    'false retire le modèle de toutes les équipes sans casser les habilitations';
+
+-- ---------------------------------------------------------------------
+-- Table : team_model  (association N-N équipe / modèle)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS llm_souverain.team_model (
+    code_team   VARCHAR(256) NOT NULL,
+    code_model  VARCHAR(128) NOT NULL,
+    granted_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT pk_team_model PRIMARY KEY (code_team, code_model),
+    CONSTRAINT fk_team_model_team FOREIGN KEY (code_team)
+        REFERENCES llm_souverain.team_llm (code_team)
+        ON UPDATE CASCADE ON DELETE CASCADE,
+    CONSTRAINT fk_team_model_model FOREIGN KEY (code_model)
+        REFERENCES llm_souverain.model_llm (code_model)
+        ON UPDATE CASCADE ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_team_model_model
+    ON llm_souverain.team_model (code_model);
+
+COMMENT ON TABLE llm_souverain.team_model IS
+    'Modèles autorisés pour une équipe. Un utilisateur hérite de l''union des modèles de ses équipes.';
+
+-- ---------------------------------------------------------------------
+-- Vue : modèles accessibles par utilisateur
+--
+-- DISTINCT parce qu'un même modèle peut être accordé à plusieurs équipes
+-- dont l'utilisateur fait partie : il ne doit apparaître qu'une fois.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE VIEW llm_souverain.v_user_models AS
+SELECT DISTINCT
+       tm.email,
+       m.code_model,
+       m.display_name,
+       m.description
+  FROM llm_souverain.team_member tm
+  JOIN llm_souverain.team_model  t ON t.code_team = tm.code_team
+  JOIN llm_souverain.model_llm   m ON m.code_model = t.code_model
+ WHERE m.active;
