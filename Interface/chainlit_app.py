@@ -19,13 +19,51 @@ from chainlit.input_widget import Select
 
 from Model.ai_model import AIModelError, ai_model
 from Engine.db import close_pool
-from LLM.llm import LLMAccessError, llm
+from LLM.llm import LLMAccessError, LLMModelUnavailable, llm
 from Engine.models import authenticate, user
 
 logging.basicConfig(level=logging.INFO)
 
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "llama3.1:8b")
+
+
+def bloc_equipes(equipes: list[dict]) -> str:
+    """Tableau markdown des équipes de l'utilisateur.
+
+    Les équipes sans modèle actif sont affichées quand même : c'est
+    souvent l'explication d'une liste de modèles plus courte que prévu.
+    """
+    if not equipes:
+        return (
+            "**Vous n'appartenez à aucune équipe.**\n\n"
+            "L'accès aux modèles passe par l'équipe : demandez à un "
+            "administrateur de vous rattacher."
+        )
+
+    lignes = [
+        f"**Vos équipes ({len(equipes)})**",
+        "",
+        "| Équipe | Code | Modèles accessibles |",
+        "| --- | --- | --- |",
+    ]
+    for e in equipes:
+        modeles = ", ".join(e["models"]) if e["models"] else "_aucun modèle actif_"
+        lignes.append(f"| {e['team_name']} | `{e['code_team']}` | {modeles} |")
+
+    total = len({m for e in equipes for m in e["models"]})
+    lignes += ["", f"Soit **{total} modèle(s)** au total, un modèle partagé "
+                   "par deux équipes n'étant compté qu'une fois."]
+    return "\n".join(lignes)
+
+
+@cl.action_callback("mes_equipes")
+async def afficher_equipes(action: cl.Action) -> None:
+    """Réaffiche la liste à la demande, sans recharger la page."""
+    assistant: llm | None = cl.user_session.get("assistant")
+    if assistant is None:
+        return
+    await cl.Message(content=bloc_equipes(await assistant.user.teams_detail())).send()
 
 
 # =====================================================================
@@ -75,22 +113,30 @@ async def on_chat_start() -> None:
         await cl.Message(content=f"Compte inconnu : `{email}`.").send()
         return
 
-    # Les modèles viennent des équipes de l'utilisateur, pas d'une constante.
-    modeles = await compte.allowed_models()
+    assistant = llm(model, compte)
+
+    # Intersection entre les habilitations de l'utilisateur et le parc
+    # réellement installé : un modèle catalogué mais absent du serveur
+    # apparaîtrait dans le sélecteur et renverrait une 404 au premier message.
+    modeles = await assistant.available_models()
     if not modeles:
-        await cl.Message(
-            content=(
-                f"Aucun modèle n'est autorisé pour `{compte.email}`. "
-                "Demande à un administrateur de rattacher ton équipe à un modèle."
+        habilites = await compte.allowed_models()
+        detail = (
+            "Demande à un administrateur de rattacher ton équipe à un modèle."
+            if not habilites
+            else (
+                "Les modèles autorisés pour toi ne sont pas installés sur le "
+                "serveur d'inférence : "
+                + ", ".join(f"`{m['code_model']}`" for m in habilites)
             )
-        ).send()
+        )
+        await cl.Message(content=f"Aucun modèle disponible pour `{compte.email}`. {detail}").send()
         return
 
-    # Modèle d'ouverture : celui du .env s'il est autorisé, sinon le premier.
+    # Modèle d'ouverture : celui du .env s'il est disponible, sinon le premier.
     codes = [m["code_model"] for m in modeles]
     model.model = DEFAULT_MODEL if DEFAULT_MODEL in codes else codes[0]
 
-    assistant = llm(model, compte)
     try:
         await assistant.authorize()
     except LLMAccessError as exc:
@@ -115,14 +161,20 @@ async def on_chat_start() -> None:
         ]
     ).send()
 
-    equipes = ", ".join(compte.teams) or "aucune équipe"
     courant = next(m["display_name"] for m in modeles if m["code_model"] == model.model)
+    equipes = await compte.teams_detail()
+
     await cl.Message(
         content=(
-            f"Bonjour {compte.login} ({equipes}).\n"
-            f"Modèle : **{courant}** — {len(modeles)} modèle(s) disponible(s) "
+            f"Bonjour **{compte.login}**.\n\n"
+            f"{bloc_equipes(equipes)}\n\n"
+            f"Modèle actif : **{courant}** — {len(modeles)} disponible(s) "
             "dans les paramètres."
-        )
+        ),
+        actions=[
+            cl.Action(name="mes_equipes", payload={}, label="Mes équipes",
+                      tooltip="Réafficher vos équipes et leurs modèles"),
+        ],
     ).send()
 
 
@@ -146,6 +198,9 @@ async def on_settings_update(settings: dict) -> None:
     except LLMAccessError as exc:
         await cl.Message(content=f"🔒 {exc}").send()
         return
+    except LLMModelUnavailable as exc:
+        await cl.Message(content=f"⚠️ {exc}").send()
+        return
 
     await cl.Message(
         content=f"Modèle basculé sur `{demande}`. La conversation est conservée."
@@ -167,6 +222,8 @@ async def on_message(message: cl.Message) -> None:
             await reply.stream_token(token)
     except LLMAccessError as exc:
         reply.content = f"🔒 {exc}"
+    except LLMModelUnavailable as exc:
+        reply.content = f"⚠️ {exc}"
     except AIModelError as exc:
         reply.content = f"❌ {exc}"
 

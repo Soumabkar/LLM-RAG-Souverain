@@ -198,3 +198,142 @@ class TestModeleInstalle:
         res = await model_llm("", "Nom").create_model(verifier=interdit)
         assert not res
         assert "obligatoire" in res.message
+
+
+# =====================================================================
+class TestCorrespondanceTag:
+    """Catalogage, supervision et sélecteur doivent appliquer la même
+    règle : un code accepté à l'ajout ne doit pas être signalé manquant
+    par la supervision juste après."""
+
+    PARC = {"qwen2.5:latest", "llama3.2:latest", "nomic-embed-text:latest"}
+
+    def test_correspondance_exacte(self):
+        from Model.ai_model import matches_installed
+
+        assert matches_installed("llama3.2:latest", self.PARC)
+
+    def test_code_sans_tag_accepte_n_importe_quel_tag(self):
+        from Model.ai_model import matches_installed
+
+        assert matches_installed("qwen2.5", self.PARC)
+
+    def test_tag_explicite_different_refuse(self):
+        """llama3.2:3b et llama3.2:latest sont des poids différents."""
+        from Model.ai_model import matches_installed
+
+        assert not matches_installed("llama3.2:3b", self.PARC)
+
+    def test_famille_inconnue_refusee(self):
+        from Model.ai_model import matches_installed
+
+        assert not matches_installed("gpt-oss", self.PARC)
+
+    async def test_add_et_check_coherents(self, db, monkeypatch):
+        import Model.ai_model as aim
+
+        async def parc(base_url=None):
+            return set(self.PARC)
+
+        async def installe(code, base_url=None):
+            return aim.matches_installed(code, self.PARC)
+
+        monkeypatch.setattr(aim, "installed_models", parc)
+        monkeypatch.setattr(aim, "is_model_installed", installe)
+
+        assert await model_llm("qwen2.5", "Qwen 2.5").create_model()
+        assert await model_llm.verifier_catalogue() == []
+
+
+# =====================================================================
+class TestTeamsDetail:
+    """Liste des équipes affichée à l'utilisateur."""
+
+    async def test_nom_et_modeles(self, catalogue, equipe_data, equipe_secu, karim):
+        await karim.join_team("SEC-01")
+        await equipe_data.add_model("llama3.1:8b")
+        await equipe_data.add_model("qwen2.5-coder:7b")
+        await equipe_secu.add_model("mistral:7b")
+
+        detail = await karim.teams_detail()
+        assert [e["code_team"] for e in detail] == ["SEC-01", "DATA-01"]  # tri par nom
+        data = next(e for e in detail if e["code_team"] == "DATA-01")
+        assert data["team_name"] == "Data Platform"
+        assert sorted(data["models"]) == ["Llama 3.1 8B", "Qwen Coder"]
+
+    async def test_equipe_sans_modele_reste_affichee(self, catalogue, equipe_data, karim):
+        """C'est souvent l'explication d'une liste de modèles plus courte
+        que prévu : la masquer rendrait le diagnostic impossible."""
+        detail = await karim.teams_detail()
+        assert [e["code_team"] for e in detail] == ["DATA-01"]
+        assert detail[0]["models"] == []
+
+    async def test_modele_desactive_exclu(self, catalogue, equipe_data, karim):
+        await equipe_data.add_model("llama3.1:8b")
+        await model_llm("llama3.1:8b", "Llama 3.1 8B").set_active(False)
+        detail = await karim.teams_detail()
+        assert detail[0]["models"] == []
+
+    async def test_sans_equipe(self, catalogue, db):
+        seul = user("seul", "Secret!2026", "seul@entreprise.fr")
+        await seul.create_user()
+        assert await seul.teams_detail() == []
+
+    async def test_contact_present(self, catalogue, equipe_data, karim):
+        assert (await karim.teams_detail())[0]["contact"] == "data@entreprise.fr"
+
+
+# =====================================================================
+class TestComptesTechniques:
+    """Un agent tourne sous un compte de service, jamais sous un compte
+    humain : ses actions doivent rester distinguables dans les journaux."""
+
+    async def test_creation(self, db, equipe_data):
+        compte, mdp = await user.creer_compte_technique(
+            "agent-rag", "agent-rag@interne", "Agent RAG documentaire", "DATA-01"
+        )
+        assert compte is not None
+        assert compte.technique is True
+        assert len(mdp) > 20  # généré, pas choisi
+        assert compte.teams == ["DATA-01"]
+
+    async def test_description_obligatoire(self, db):
+        """Un compte de service sans raison d'être documentée devient
+        impossible à auditer six mois plus tard."""
+        compte, message = await user.creer_compte_technique("x", "x@interne", "   ")
+        assert compte is None
+        assert "description" in message.lower()
+
+    async def test_connexion_interactive_refusee(self, db, equipe_data):
+        from Engine.models import authenticate
+
+        _, mdp = await user.creer_compte_technique(
+            "agent-rag", "agent-rag@interne", "Agent RAG", "DATA-01"
+        )
+        assert await authenticate("agent-rag@interne", mdp) is None
+        assert await authenticate("agent-rag", mdp) is None
+
+    async def test_compte_humain_non_technique(self, karim):
+        recharge = await user.load("karim@entreprise.fr")
+        assert recharge.technique is False
+
+    async def test_inventaire(self, catalogue, db, equipe_data, karim):
+        await equipe_data.add_model("llama3.1:8b")
+        await user.creer_compte_technique(
+            "agent-rag", "agent-rag@interne", "Agent RAG", "DATA-01"
+        )
+        inventaire = await user.comptes_techniques()
+
+        assert [c["login"] for c in inventaire] == ["agent-rag"]
+        assert inventaire[0]["equipes"] == ["DATA-01"]
+        assert inventaire[0]["modeles"] == ["llama3.1:8b"]
+        # Le compte humain n'apparaît pas dans l'inventaire technique
+        assert "ksoumahoro" not in [c["login"] for c in inventaire]
+
+    async def test_habilitations_comme_un_compte_humain(self, catalogue, equipe_data):
+        await equipe_data.add_model("llama3.1:8b")
+        compte, _ = await user.creer_compte_technique(
+            "agent-rag", "agent-rag@interne", "Agent RAG", "DATA-01"
+        )
+        assert await compte.can_use_model("llama3.1:8b")
+        assert not await compte.can_use_model("mistral:7b")

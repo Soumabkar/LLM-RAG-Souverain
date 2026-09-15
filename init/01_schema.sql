@@ -33,9 +33,16 @@ CREATE TABLE IF NOT EXISTS llm_souverain.user_llm (
     login       VARCHAR(50)  NOT NULL,
     password    VARCHAR(256) NOT NULL,
     email       VARCHAR(256) NOT NULL,
+    -- Un compte technique porte un agent : il ne doit jamais pouvoir
+    -- ouvrir une session interactive.
+    technique   BOOLEAN      NOT NULL DEFAULT false,
+    description VARCHAR(256),
     CONSTRAINT pk_user_llm       PRIMARY KEY (email),
     CONSTRAINT uq_user_llm_login UNIQUE (login)
 );
+
+CREATE INDEX IF NOT EXISTS idx_user_llm_technique
+    ON llm_souverain.user_llm (email) WHERE technique;
 
 COMMENT ON TABLE  llm_souverain.user_llm          IS 'Comptes utilisateurs';
 COMMENT ON COLUMN llm_souverain.user_llm.email    IS 'Clé primaire : identifiant unique du compte';
@@ -151,3 +158,25 @@ SELECT DISTINCT
   JOIN llm_souverain.team_model  t ON t.code_team = tm.code_team
   JOIN llm_souverain.model_llm   m ON m.code_model = t.code_model
  WHERE m.active;
+
+-- ---------------------------------------------------------------------
+-- Vue : inventaire des comptes techniques
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE VIEW llm_souverain.v_comptes_techniques AS
+SELECT u.email,
+       u.login,
+       u.description,
+       coalesce(
+           array_agg(DISTINCT t.code_team) FILTER (WHERE t.code_team IS NOT NULL),
+           '{}'
+       ) AS equipes,
+       coalesce(
+           array_agg(DISTINCT m.code_model) FILTER (WHERE m.code_model IS NOT NULL),
+           '{}'
+       ) AS modeles
+  FROM llm_souverain.user_llm u
+  LEFT JOIN llm_souverain.team_member t ON t.email = u.email
+  LEFT JOIN llm_souverain.team_model  x ON x.code_team = t.code_team
+  LEFT JOIN llm_souverain.model_llm   m ON m.code_model = x.code_model AND m.active
+ WHERE u.technique
+ GROUP BY u.email, u.login, u.description;

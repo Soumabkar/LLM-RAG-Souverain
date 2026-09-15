@@ -52,24 +52,24 @@ _pool: AsyncConnectionPool | None = None
 _lock = asyncio.Lock()
 
 
-def _env(name: str, default: str) -> str:
+def _env(name: str, default: str = "") -> str:
     """Lit une variable d'environnement en la nettoyant.
 
     Le .strip() n'est pas cosmétique : un fichier .env enregistré sous
-    Windows (CRLF) laisse un \\r en fin de valeur, qui produit un
-    « failed to resolve host 'localhost\\r' » ou un échec d'authentification
-    parfaitement invisible à la lecture.
+    Windows (CRLF) laisse un \r en fin de valeur, qui produit un
+    « failed to resolve host 'localhost\r' » invisible à la lecture.
     """
-    return os.getenv(name, default).strip()
+    valeur = os.getenv(name)
+    return (valeur if valeur is not None else default).strip()
 
 
 def _conninfo() -> str:
     return psycopg.conninfo.make_conninfo(
-        host=_env("POSTGRES_HOST", "localhost"),
-        port=_env("POSTGRES_PORT", "5432"),
-        dbname=_env("POSTGRES_DB", "llm_souverain_db"),
-        user=_env("POSTGRES_USER", "llm_admin"),
-        password=_env("POSTGRES_PASSWORD", ""),
+        host=_env("POSTGRES_HOST"),
+        port=_env("POSTGRES_PORT"),
+        dbname=_env("POSTGRES_DB"),
+        user=_env("POSTGRES_USER"),
+        password=_env("POSTGRES_PASSWORD"),
     )
 
 

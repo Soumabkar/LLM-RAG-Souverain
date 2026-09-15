@@ -21,6 +21,7 @@ s'appellent avec `await`. Les helpers purement mémoire (`set_password`,
 from __future__ import annotations
 
 import logging
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -87,14 +88,27 @@ def _first_error(*controles: str | None) -> str | None:
 class user:
     """Compte utilisateur. La clé primaire fonctionnelle est l'email."""
 
-    def __init__(self, login: str, password: str, email: str):
+    def __init__(
+        self,
+        login: str,
+        password: str,
+        email: str,
+        technique: bool = False,
+        description: str | None = None,
+    ):
         self.login = login
         self.password = password  # en clair en mémoire, haché à l'écriture
         self.email = email
+        # Un compte technique porte un agent. Il possède des habilitations
+        # comme un compte humain, mais ne peut pas ouvrir de session
+        # interactive : voir `authenticate`.
+        self.technique = technique
+        self.description = description
         self.teams: list[str] = []
 
     def __repr__(self) -> str:  # pragma: no cover
-        return f"user(login={self.login!r}, email={self.email!r}, teams={self.teams!r})"
+        marque = " technique" if self.technique else ""
+        return f"user{marque}(login={self.login!r}, email={self.email!r}, teams={self.teams!r})"
 
     @property
     def code_team(self) -> str | None:
@@ -129,11 +143,13 @@ class user:
 
                 await cur.execute(
                     """
-                    INSERT INTO llm_souverain.user_llm (login, password, email)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO llm_souverain.user_llm
+                        (login, password, email, technique, description)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (email) DO NOTHING
                     """,
-                    (self.login, ensure_hashed(self.password), self.email),
+                    (self.login, ensure_hashed(self.password), self.email,
+                     self.technique, self.description),
                 )
                 if cur.rowcount == 0:
                     return Result(False, f"L'utilisateur '{self.email}' existe déjà.")
@@ -276,6 +292,51 @@ class user:
             return await cur.fetchone() is not None
 
     # -----------------------------------------------------------------
+    @classmethod
+    async def creer_compte_technique(
+        cls, login: str, email: str, description: str, code_team: str | None = None
+    ) -> tuple["user | None", str]:
+        """Crée un compte de service porté par un agent.
+
+        Le mot de passe est généré et renvoyé une seule fois : il ne sert
+        qu'à la contrainte NOT NULL de la colonne, puisque ces comptes ne
+        se connectent jamais. Le conserver permet néanmoins de basculer
+        un agent vers une API authentifiée sans recréer le compte.
+
+        La description est obligatoire : un compte technique sans raison
+        d'être documentée devient impossible à auditer six mois plus tard.
+
+        Returns:
+            Le compte créé et son mot de passe en clair, ou (None, message).
+        """
+        if not description or not description.strip():
+            return None, "La description est obligatoire pour un compte technique."
+
+        mot_de_passe = secrets.token_urlsafe(32)
+        compte = cls(login, mot_de_passe, email, technique=True,
+                     description=description.strip())
+
+        resultat = await compte.create_user(code_team)
+        if not resultat:
+            return None, resultat.message
+
+        logger.info("Compte technique créé : %s (%s)", email, description)
+        return compte, mot_de_passe
+
+    @staticmethod
+    async def comptes_techniques() -> list[dict[str, Any]]:
+        """Inventaire des comptes de service, avec équipes et modèles."""
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT email, login, description, equipes, modeles
+                  FROM llm_souverain.v_comptes_techniques
+                 ORDER BY login
+                """
+            )
+            return await cur.fetchall()
+
+    # -----------------------------------------------------------------
     # Modèles accessibles
     # -----------------------------------------------------------------
     async def allowed_models(self) -> list[dict[str, Any]]:
@@ -291,6 +352,42 @@ class user:
                   FROM llm_souverain.v_user_models
                  WHERE email = %s
                  ORDER BY display_name
+                """,
+                (self.email,),
+            )
+            return await cur.fetchall()
+
+    async def teams_detail(self) -> list[dict[str, Any]]:
+        """Équipes de l'utilisateur, avec leur nom et les modèles qu'elles donnent.
+
+        Une seule requête plutôt qu'un appel par équipe : la liste est
+        affichée à chaque ouverture de session.
+
+        La condition `m.active` est portée par la jointure et non par le
+        WHERE : sinon une équipe sans aucun modèle actif disparaîtrait de
+        la liste, alors qu'il faut justement la montrer pour que
+        l'utilisateur comprenne pourquoi son choix est limité.
+        """
+        async with get_connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT t.code_team,
+                       t.team_name,
+                       t.email AS contact,
+                       tm.joined_at,
+                       coalesce(
+                           array_agg(DISTINCT m.display_name)
+                               FILTER (WHERE m.display_name IS NOT NULL),
+                           '{}'
+                       ) AS models
+                  FROM llm_souverain.team_member tm
+                  JOIN llm_souverain.team_llm   t ON t.code_team = tm.code_team
+                  LEFT JOIN llm_souverain.team_model x ON x.code_team = t.code_team
+                  LEFT JOIN llm_souverain.model_llm  m ON m.code_model = x.code_model
+                                                      AND m.active
+                 WHERE tm.email = %s
+                 GROUP BY t.code_team, t.team_name, t.email, tm.joined_at
+                 ORDER BY t.team_name
                 """,
                 (self.email,),
             )
@@ -329,7 +426,7 @@ class user:
         async with get_connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT login, password, email
+                SELECT login, password, email, technique, description
                   FROM llm_souverain.user_llm
                  WHERE email = %s
                 """,
@@ -343,7 +440,7 @@ class user:
         async with get_connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT login, password, email
+                SELECT login, password, email, technique, description
                   FROM llm_souverain.user_llm
                  WHERE login = %s
                 """,
@@ -357,7 +454,9 @@ class user:
         row = await cls.find(email)
         if row is None:
             return None
-        instance = cls(row["login"], row["password"], row["email"])
+        instance = cls(row["login"], row["password"], row["email"],
+                       technique=row.get("technique", False),
+                       description=row.get("description"))
         await instance.load_teams()
         return instance
 
@@ -864,11 +963,22 @@ async def authenticate(identifiant: str, mot_de_passe: str) -> user | None:
         logger.info("Authentification refusée : identifiant '%s' inconnu", identifiant)
         return None
 
+    if ligne.get("technique"):
+        # Vérification du mot de passe quand même : sans cela, le temps de
+        # réponse révélerait quels comptes sont techniques.
+        verify_password(mot_de_passe, ligne["password"])
+        logger.warning(
+            "Tentative de connexion interactive sur le compte technique %s",
+            ligne["email"],
+        )
+        return None
+
     if not verify_password(mot_de_passe, ligne["password"]):
         logger.info("Authentification refusée : mot de passe invalide pour %s", ligne["email"])
         return None
 
-    compte = user(ligne["login"], ligne["password"], ligne["email"])
+    compte = user(ligne["login"], ligne["password"], ligne["email"],
+                  technique=False, description=ligne.get("description"))
     await compte.load_teams()
 
     # Migration opportuniste : le seul moment où le mot de passe en clair est

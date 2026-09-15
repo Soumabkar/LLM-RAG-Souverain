@@ -12,7 +12,7 @@ Une instance = une conversation d'un utilisateur. L'historique vit dans
 from __future__ import annotations
 
 import logging
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from Model.ai_model import (
     AIModelError,
@@ -22,6 +22,9 @@ from Model.ai_model import (
     matches_installed,
 )
 from Engine.models import user
+
+if TYPE_CHECKING:  # pragma: no cover
+    from Agent import BaseAgent, RegistreOutils
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,10 @@ class llm:
         # Certains déploiements exigent un rattachement pour ouvrir l'accès ;
         # d'autres acceptent un compte isolé. À toi de trancher.
         self.require_team = require_team
+        # Humain pour le compte de qui la session s'exécute, quand il
+        # s'agit d'une session technique. Tracé, jamais utilisé pour les
+        # droits.
+        self.mandant: str | None = None
         self._authorized = False
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -182,11 +189,180 @@ class llm:
             yield token
 
     # -----------------------------------------------------------------
+    @property
+    def client(self):
+        """Client d'inférence de la session.
+
+        Exposé pour que l'agent n'ait pas à traverser `session.model.client` :
+        il ne connaît que la session.
+        """
+        return self.model.client
+
+    # -----------------------------------------------------------------
+    @classmethod
+    async def pour_compte_technique(
+        cls,
+        email: str,
+        client: Any,
+        modele: str | None = None,
+        mandant: str | None = None,
+    ) -> "llm":
+        """Ouvre une session au nom d'un compte de service.
+
+        Args:
+            email: identifiant du compte technique.
+            client: client d'inférence à utiliser.
+            modele: modèle imposé. Par défaut, le premier modèle habilité
+                pour le compte — un agent n'a pas d'interface pour choisir.
+            mandant: email de l'humain pour le compte de qui l'agent
+                s'exécute. Uniquement tracé, jamais utilisé pour les
+                droits : ceux du compte technique font foi.
+
+        Raises:
+            LLMAccessError: compte inconnu, non technique, ou sans modèle.
+        """
+        from Model.ai_model import ai_model
+        from Engine.models import user
+
+        compte = await user.load(email)
+        if compte is None:
+            raise LLMAccessError(f"Compte technique '{email}' introuvable.")
+        if not compte.technique:
+            # Refus explicite : faire tourner un agent sous un compte humain
+            # signifierait que ses actions sont indiscernables de celles de
+            # la personne dans les journaux.
+            raise LLMAccessError(
+                f"'{email}' n'est pas un compte technique. "
+                "Créer un compte dédié avec user.creer_compte_technique()."
+            )
+
+        habilites = await compte.allowed_models()
+        if not habilites:
+            raise LLMAccessError(
+                f"Le compte technique '{email}' n'a aucun modèle habilité : "
+                "rattacher son équipe à un modèle."
+            )
+
+        codes = [m["code_model"] for m in habilites]
+        if modele is None:
+            modele = codes[0]
+        elif modele not in codes:
+            raise LLMAccessError(
+                f"Le modèle '{modele}' n'est pas habilité pour '{email}'. "
+                f"Disponibles : {', '.join(codes)}."
+            )
+
+        session = cls(ai_model(modele, client), compte)
+        session.mandant = mandant
+        await session.authorize()
+        logger.info(
+            "Session technique ouverte : %s sur %s%s",
+            email, modele, f" pour le compte de {mandant}" if mandant else "",
+        )
+        return session
+
+    # -----------------------------------------------------------------
+    async def deleguer(
+        self, email_technique: str, strict: bool = True
+    ) -> "llm":
+        """Ouvre une session technique pour le compte de cet utilisateur.
+
+        Args:
+            strict: exige que les modèles du compte technique soient un
+                sous-ensemble de ceux de l'utilisateur. C'est le garde-fou
+                contre l'élévation de privilège : sans lui, un agent
+                deviendrait un moyen d'accéder à des modèles auxquels la
+                personne n'a pas droit.
+
+                Passer False n'a de sens que pour un agent déclenché par
+                l'administration, pas par un utilisateur final.
+        """
+        session = await llm.pour_compte_technique(
+            email_technique, self.client, mandant=self.user.email
+        )
+
+        if strict:
+            miens = {m["code_model"] for m in await self.user.allowed_models()}
+            siens = {m["code_model"] for m in await session.user.allowed_models()}
+            en_trop = siens - miens
+            if en_trop:
+                raise LLMAccessError(
+                    f"Délégation refusée : le compte technique '{email_technique}' "
+                    f"donnerait accès à {', '.join(sorted(en_trop))}, "
+                    f"hors des droits de '{self.user.email}'."
+                )
+
+        return session
+
+    # -----------------------------------------------------------------
+    # Protocole attendu par le package Agent
+    #
+    # Deux méthodes, et rien d'autre : le package Agent ne connaît ni
+    # cette classe ni la couche base. C'est ce qui permet de tester les
+    # agents sans PostgreSQL, et d'échanger l'implémentation de session.
+    # -----------------------------------------------------------------
+    async def modele_courant(self) -> str:
+        """Modèle actuellement sélectionné par l'utilisateur."""
+        return self.model.model
+
+    async def autorise(self, code_model: str) -> bool:
+        """Habilitation ET présence sur le serveur d'inférence.
+
+        Les deux conditions sont vérifiées : un modèle autorisé mais
+        désinstallé ferait échouer l'agent en cours d'exécution, après
+        consommation de jetons.
+        """
+        if not await self.user.can_use_model(code_model):
+            return False
+        disponibles = await self.installed()
+        return disponibles is None or matches_installed(code_model, disponibles)
+
+    # -----------------------------------------------------------------
+    def agent(
+        self,
+        type_agent: str = "loop",
+        outils: "RegistreOutils | None" = None,
+        **options: Any,
+    ) -> "BaseAgent":
+        """Construit un agent adossé à cette session.
+
+        L'agent reçoit la session elle-même : il en tire le client, le
+        modèle courant et les droits. Un changement de modèle depuis
+        l'interface s'applique donc au message suivant, sans reconstruire
+        l'agent.
+
+        Pour faire tourner l'agent sous un compte de service plutôt que
+        sous celui de l'utilisateur :
+
+            technique = await session.deleguer("agent-rag@interne")
+            agent = technique.agent("loop", outils)
+        """
+        if outils is None:
+            from Agent import RegistreOutils
+            outils = RegistreOutils()
+
+        if type_agent == "loop":
+            from Agent import LoopAgentic
+            return LoopAgentic(self, outils, **options)
+        if type_agent == "pydantic":
+            from Agent.pydantic_agent import PydanticAgent
+            return PydanticAgent(self, outils, **options)
+        if type_agent == "langgraph":
+            from Agent.langgraph_agent import LangGraphAgent
+            return LangGraphAgent(self, outils, **options)
+
+        raise ValueError(
+            f"Type d'agent inconnu : '{type_agent}'. "
+            "Valeurs acceptées : loop, pydantic, langgraph."
+        )
+
+    # -----------------------------------------------------------------
     def _trace(self, reponse: ChatResponse) -> None:
         """Trace l'usage. Point d'accroche pour une table llm_usage."""
         logger.info(
-            "llm | %s | équipes=%s | modèle=%s | %s tokens | %s ms",
+            "llm | %s%s | équipes=%s | modèle=%s | %s tokens | %s ms",
             self.user.email,
+            f" (pour {self.mandant})" if self.mandant else "",
             ",".join(self.user.teams) or "-",
             reponse.model,
             reponse.completion_tokens,
