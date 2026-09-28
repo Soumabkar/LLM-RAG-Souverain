@@ -1,0 +1,37 @@
+# Ajouts au docker-compose.yml existant pour le RAG.
+#
+# 1. Remplacer l'image PostgreSQL : postgres:16-alpine n'embarque pas
+#    l'extension vector.
+# 2. Ajouter le service MinIO.
+#
+# Le changement d'image passe d'Alpine (musl) à Debian (glibc) : sur une
+# base de développement, repartir d'un volume neuf évite tout écart de
+# collation — docker compose down -v, puis admin_compte.py initialiser.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16      # au lieu de postgres:16-alpine
+
+  minio:
+    image: minio/minio:latest
+    container_name: llm_souverain_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY manquant dans .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY manquant dans .env}
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # console d'administration
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - llm_souverain_net
+
+volumes:
+  minio_data:

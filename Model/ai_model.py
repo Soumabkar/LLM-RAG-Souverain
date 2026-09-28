@@ -104,7 +104,7 @@ class ai_model:
         model: str,
         client: AsyncOpenAI,
         system_prompt: str | None = DEFAULT_SYSTEM_PROMPT,
-        temperature: float = 0.7,
+        temperature: float = 0.2, #0,7
         max_tokens: int | None = 1024,
         max_history: int = 20,
         max_retries: int = 3,

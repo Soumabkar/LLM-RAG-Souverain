@@ -1,0 +1,20 @@
+/* Logo de la page de connexion : contenu dans sa zone, pas recadré */
+img[src*="login_logo"] {
+  object-fit: contain !important;
+  padding: 4rem;
+  background-color: #ffffff;
+}
+
+img[src*="/logo"] {
+  content: url("/public/logo_light.png");
+  max-height: 48px;
+  width: auto;
+}
+
+/* Variante si Chainlit l'applique en image de fond */
+[style*="login_logo"] {
+  background-size: contain !important;
+  background-repeat: no-repeat !important;
+  background-position: center !important;
+  background-color: #ffffff;
+}

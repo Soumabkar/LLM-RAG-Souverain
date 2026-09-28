@@ -1,0 +1,14 @@
+# --- Ajouts au requirements.txt pour le RAG ---
+minio>=7.2
+pypdf>=5.0          # PDF
+pyarrow>=15.0       # Parquet
+fastavro>=1.9       # Avro
+
+# Bases vectorielles — n'installer que celle retenue
+# pgvector : aucune dépendance Python, passe par psycopg
+faiss-cpu>=1.8      # développement et tests
+# qdrant-client>=1.9
+
+# Tests
+moto[server]>=5.0   # serveur S3 pour tester MinIOStorage
+reportlab>=4.0      # génération de PDF de test
